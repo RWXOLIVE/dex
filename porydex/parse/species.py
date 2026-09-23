@@ -51,10 +51,161 @@ SPECIAL_ABILITIES: dict[str, SpecialAbilities] = {
     'Zygarde': SpecialAbilities('Power-Construct', 'Power Construct'),
 }
 
+
+# Map named Expansion type constants (TYPE_FIRE, TYPE_WATER, etc.) to the
+# indexes used by Porydex's DAMAGE_TYPE table.
+TYPE_ID_TO_INDEX = {
+    f'TYPE_{name.upper()}': idx
+    for idx, name in enumerate(DAMAGE_TYPE)
+}
+
+
+def extract_known_int(expr, known_ids: dict[str, int]) -> int:
+    """Read either a numeric C expression or a known named constant."""
+    try:
+        return extract_int(expr)
+    except (AttributeError, ValueError):
+        key = extract_id(expr)
+        if key in known_ids:
+            return known_ids[key]
+        raise
+
+
+def extract_damage_type(expr) -> str:
+    """
+    Convert an Expansion type expression into the Showdown/Porydex type name.
+
+    Older Porydex DAMAGE_TYPE tables may stop at Fairy while Expansion 1.13
+    can expose TYPE_STELLAR as numeric id 20. Handle that here instead of
+    indexing past the end of DAMAGE_TYPE.
+    """
+    try:
+        type_id = extract_int(expr)
+    except (AttributeError, ValueError):
+        type_name = extract_id(expr)
+
+        if type_name in TYPE_ID_TO_INDEX:
+            return DAMAGE_TYPE[TYPE_ID_TO_INDEX[type_name]]
+
+        if type_name == 'TYPE_STELLAR':
+            return 'Stellar'
+
+        raise ValueError(f'unknown Pokemon type constant: {type_name}')
+
+    if 0 <= type_id < len(DAMAGE_TYPE):
+        return DAMAGE_TYPE[type_id]
+
+    # Expansion's Stellar type. This is the value that causes older Porydex
+    # versions to throw: IndexError: list index out of range.
+    if type_id == 20:
+        return 'Stellar'
+
+    raise ValueError(
+        f'Pokemon type id {type_id} is not supported by this Porydex '
+        f'(DAMAGE_TYPE has {len(DAMAGE_TYPE)} entries)'
+    )
+
+
+
+def build_form_table_species_ids(species_data) -> dict[str, list[int]]:
+    """
+    Build each form table's species membership from the CURRENT gSpeciesInfo.
+
+    This makes form handling follow the species IDs in the Expansion project
+    being parsed instead of assuming the numeric IDs from another Expansion
+    version or an older Porydex cache.
+    """
+    refs: dict[str, list[int]] = defaultdict(list)
+
+    for species_init in species_data:
+        try:
+            species_id = extract_int(species_init.name[0])
+        except (AttributeError, ValueError, TypeError, IndexError):
+            continue
+
+        fields = getattr(getattr(species_init, 'expr', None), 'exprs', None)
+        if not fields:
+            continue
+
+        for field_init in fields:
+            try:
+                field_name = field_init.name[0].name
+            except (AttributeError, TypeError, IndexError):
+                continue
+
+            if field_name != 'formSpeciesIdTable':
+                continue
+
+            try:
+                table_name = extract_id(field_init.expr)
+            except (AttributeError, ValueError):
+                break
+
+            if species_id not in refs[table_name]:
+                refs[table_name].append(species_id)
+            break
+
+    return dict(refs)
+
+
+def resolve_dynamic_form_name(mon: dict,
+                              table_name: str,
+                              table: dict[int, str],
+                              form_table_species_ids: dict[str, list[int]]) -> tuple[bool, str | None]:
+    """
+    Resolve a form against the CURRENT species file.
+
+    Returns:
+        (is_base_form, form_name)
+
+    form_name is None for the base form or when no safe mapping can be made.
+    """
+    if not table:
+        return False, None
+
+    mon_num = mon['num']
+    current_ids = form_table_species_ids.get(table_name, [])
+    table_values = list(table.values())
+
+    # Preferred path: use the order of species that reference this table in
+    # the currently loaded gSpeciesInfo. That keeps the mapping valid when
+    # custom species/forms shift numeric species IDs.
+    if current_ids and mon_num in current_ids:
+        form_index = current_ids.index(mon_num)
+
+        if form_index == 0:
+            return True, None
+
+        if form_index < len(table_values):
+            return False, table_values[form_index]
+
+        # Some Expansion layouts put Ogerpon Tera forms after the regular
+        # mask forms while reusing the same form-name table.
+        if mon.get('name') == 'Ogerpon':
+            tera_index = form_index - len(table_values)
+            if 0 <= tera_index < len(table_values):
+                return False, f'{table_values[tera_index]}-Tera'
+
+        return False, None
+
+    # If the parsed form table already contains the live species ID, use it.
+    if mon_num in table:
+        keys = list(table.keys())
+        return keys[0] == mon_num, table[mon_num]
+
+    # Compatibility fallback for Ogerpon layouts where Tera form IDs are
+    # offset by four from the regular mask forms.
+    if mon.get('name') == 'Ogerpon' and (mon_num - 4) in table:
+        return False, f'{table[mon_num - 4]}-Tera'
+
+    return False, None
+
+
 def parse_mon(struct_init: NamedInitializer,
               ability_names: list[str],
               item_names: list[str],
               form_tables: dict[str, dict[int, str]],
+              form_table_species_ids: dict[str, list[int]],
               level_up_learnsets: dict[str, dict[str, list[int]]],
               teachable_learnsets: dict[str, dict[str, list[str]]],
               national_dex: dict[str, int]) -> tuple[dict, list, dict, dict]:
@@ -89,7 +240,7 @@ def parse_mon(struct_init: NamedInitializer,
             case 'baseSpDefense':
                 mon['baseStats']['spd'] = extract_int(field_expr)
             case 'types':
-                types = [DAMAGE_TYPE[extract_int(t)] for t in field_expr.exprs]
+                types = [extract_damage_type(t) for t in field_expr.exprs]
                 unique_types = []
                 [unique_types.append(t) for t in types if t not in unique_types]
                 mon['types'].extend(unique_types)
@@ -173,25 +324,40 @@ def parse_mon(struct_init: NamedInitializer,
             case 'itemUncommon':
                 mon['items']['U'] = item_names[extract_int(field_expr)]
             case 'formSpeciesIdTable':
-                # The base form keeps a formeOrder field that specifies the order in
-                # which forms are shown as well as an otherFormes field which lists
-                # the full name of each other forme. Alternate formes only specify
-                # their respective base form, their own form name, and their full
-                # conjuncted name as species+form.
-                table = form_tables[extract_id(field_expr)]
+                # Use the form-table membership from the CURRENT gSpeciesInfo
+                # instead of assuming numeric species IDs are unchanged.
+                table_name = extract_id(field_expr)
+                table = form_tables.get(table_name)
 
-                # If there is only one entry in the table, don't bother
-                if len(table.keys()) == 1:
+                if not table:
+                    # A missing/disabled form table should not stop the rest of
+                    # the species data from exporting.
                     continue
 
-                if list(table.keys())[0] == mon['num']:
-                    table_vals = list(table.values())
+                table_vals = list(table.values())
+                current_ids = form_table_species_ids.get(table_name, [])
+
+                # A one-entry table has no alternate form metadata to build.
+                if len(table_vals) == 1:
+                    continue
+
+                is_base_form, resolved_form_name = resolve_dynamic_form_name(
+                    mon,
+                    table_name,
+                    table,
+                    form_table_species_ids,
+                )
+
+                if is_base_form:
                     if table_vals[0] != 'Base':
                         mon['baseForme'] = table_vals[0]
 
                     # Ugly Urshifu hack
                     if mon['name'] == 'Urshifu':
-                        mon['formeOrder'] = [mon['name'] + (f'-{table_vals[i].replace("-Style", "")}' if i > 0 else '') for i in range(len(table.keys()))]
+                        mon['formeOrder'] = [
+                            mon['name'] + (f'-{table_vals[i].replace("-Style", "")}' if i > 0 else '')
+                            for i in range(len(table_vals))
+                        ]
                     # Ugly Xerneas hack
                     elif mon['name'] == 'Xerneas':
                         mon['formeOrder'] = ['Xerneas', 'Xerneas-Neutral']
@@ -202,7 +368,7 @@ def parse_mon(struct_init: NamedInitializer,
                         mon['formeOrder'] = [f'{mon["name"]}', f'{mon["name"]}-Icy-Snow']
                         mon['formeOrder'].extend([
                             f'{mon["name"]}-{table_vals[i]}'
-                            for i in range(len(table.keys()))
+                            for i in range(len(table_vals))
                             if table_vals[i] not in ('Base', COSMETIC_FORME_SPECIES[mon['name']].base)
                         ])
                     # Ugly Minior hack
@@ -211,8 +377,9 @@ def parse_mon(struct_init: NamedInitializer,
                         mon['formeOrder'] = [f'{mon["name"]}', f'{mon["name"]}-Meteor']
                         mon['formeOrder'].extend([
                             f'{mon["name"]}-{table_vals[i]}'
-                            for i in range(len(table.keys()))
-                            if table_vals[i] not in ('Base', COSMETIC_FORME_SPECIES[mon['name']].base) and 'Meteor' not in table_vals[i]
+                            for i in range(len(table_vals))
+                            if table_vals[i] not in ('Base', COSMETIC_FORME_SPECIES[mon['name']].base)
+                            and 'Meteor' not in table_vals[i]
                         ])
                     # Ugly Zygarde hack
                     elif mon['name'] == 'Zygarde':
@@ -225,7 +392,7 @@ def parse_mon(struct_init: NamedInitializer,
                     else:
                         mon['formeOrder'] = [
                             mon['name'] + (f'-{table_vals[i]}' if i > 0 else '')
-                            for i in range(len(table.keys()))
+                            for i in range(len(table_vals))
                         ]
 
                     # Cosmetic Formes
@@ -234,29 +401,47 @@ def parse_mon(struct_init: NamedInitializer,
                         if cosmetics.alts is not None:
                             mon['cosmeticFormes'] = [
                                 f'{mon["name"]}-{table_vals[i]}'
-                                for i in range(len(table.keys()))
-                                if table_vals[i] not in ('Base', '', cosmetics.base) \
-                                    and table_vals[i] not in cosmetics.alts \
-                                    and (cosmetics.exclude_pattern is None or not re.match(cosmetics.exclude_pattern, table_vals[i]))
+                                for i in range(len(table_vals))
+                                if table_vals[i] not in ('Base', '', cosmetics.base)
+                                and table_vals[i] not in cosmetics.alts
+                                and (
+                                    cosmetics.exclude_pattern is None
+                                    or not re.match(cosmetics.exclude_pattern, table_vals[i])
+                                )
                             ]
                             mon['baseForme'] = cosmetics.base
 
                             if cosmetics.alts:
-                                mon['otherFormes'] = list(map(lambda alt: f'{mon["name"]}-{alt}', cosmetics.alts))
+                                mon['otherFormes'] = list(
+                                    map(lambda alt: f'{mon["name"]}-{alt}', cosmetics.alts)
+                                )
                     else:
                         mon['otherFormes'] = mon['formeOrder'][1:]
+
                 else:
-                    # ugly ogerpon tera forms hack
-                    if mon['name'] == 'Ogerpon' and mon['num'] not in table:
-                        form_name = f'{table[mon["num"] - 4]}-Tera'
-                    # ugly xerneas neutral-active swap
-                    elif mon['name'] == 'Xerneas':
+                    # If gSpeciesInfo says this species belongs to the form
+                    # table but the form-name table is shorter, do not guess or
+                    # crash. Export the species without forme metadata and show
+                    # enough information to diagnose the table.
+                    if resolved_form_name is None:
+                        if current_ids and mon['num'] in current_ids:
+                            print(
+                                f'warning: could not dynamically map species '
+                                f'{mon.get("name", "?")} (id {mon["num"]}) in '
+                                f'{table_name}; live ids={current_ids}, '
+                                f'form values={table_vals}'
+                            )
+                        continue
+
+                    form_name = resolved_form_name
+
+                    # Xerneas' alternate entry is represented specially by Showdown.
+                    if mon['name'] == 'Xerneas':
                         form_name = 'Neutral'
-                    # ugly urshifu forms hack
+                    # Urshifu form names contain -Style in Expansion.
                     elif mon['name'] == 'Urshifu':
-                        form_name = table[mon['num']].replace('-Style', '')
-                    else:
-                        form_name = table[mon['num']]
+                        form_name = form_name.replace('-Style', '')
+
                     mon['baseSpecies'] = mon['name']
                     mon['forme'] = form_name
                     mon['name'] = f'{mon["name"]}-{form_name}'
@@ -426,9 +611,12 @@ def parse_species_data(species_data: ExprList,
     all_species_data = {}
     all_learnsets = {}
     key: str
+
+    form_table_species_ids = build_form_table_species_ids(species_data)
+
     for species_init in species_data:
         try:
-            mon, evos, lvlup_learnset, teach_learnset = parse_mon(species_init, abilities, items, forms, level_up_learnsets, teachable_learnsets, national_dex)
+            mon, evos, lvlup_learnset, teach_learnset = parse_mon(species_init, abilities, items, forms, form_table_species_ids, level_up_learnsets, teachable_learnsets, national_dex)
             all_species_data[mon['num']] = (mon, evos)
 
             if 'name' not in mon or not mon['name']:

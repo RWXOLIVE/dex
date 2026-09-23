@@ -84,7 +84,12 @@ def extract(args):
     expansion_data = porydex.config.expansion / 'src' / 'data'
     custom_headers = pathlib.Path('custom_headers')
     moves = parse_moves(expansion_data / 'moves_info.h')
-    move_names = [move['name'] for move in sorted(moves.values(), key=lambda m: m['num'])]
+    # Move IDs are used as array indices throughout the learnset tables.
+    # Expansions can leave gaps in those IDs, so a sorted compact list shifts
+    # every name after a missing ID onto the wrong move.
+    move_names = [''] * (max(move['num'] for move in moves.values()) + 1)
+    for move in moves.values():
+        move_names[move['num']] = move['name']
 
     abilities = parse_abilities(expansion_data / 'abilities.h')
     items = parse_items(expansion_data / 'items.h')

@@ -33,9 +33,13 @@ def index(moves: dict, species: dict, learnsets: dict, encounters: dict):
         if key.startswith('gmax') or (key.startswith('hiddenpower') and len(key) > 11) or vanilla.get('isNonstandard', '') == 'CAP':
             continue
 
-        assert key in moves, f'Failed to find move {key} in loaded moves data!'
-        moves[key]['desc'] = vanilla['desc']
-        moves[key]['shortDesc'] = vanilla['shortDesc']
+        expansion_key = VANILLA_MOVE_KEY_ALIASES.get(key, key)
+        if expansion_key not in moves:
+            # An expansion can intentionally omit a move from its configured
+            # move table; it should not prevent exporting the moves it has.
+            continue
+        moves[expansion_key]['desc'] = vanilla['desc']
+        moves[expansion_key]['shortDesc'] = vanilla['shortDesc']
 
     index = []
     index.extend(list(map(lambda s: s + ' pokemon', species.keys())))
